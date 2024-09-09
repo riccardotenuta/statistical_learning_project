@@ -1,0 +1,347 @@
+---
+title: "Statiscal Learning project"
+author: "Riccardo Tenuta"
+date: "2024-07-17"
+output: html_document
+---
+
+```{r}
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(corrplot)
+library(cluster)
+library(mltools)
+library(data.table)
+library(dataPreparation)
+library(FactoMineR)
+library(factoextra)
+library(grid)
+library(gridExtra)
+library(ggplot2)
+library(ggfortify)
+library(bios2mds)
+library(ggdendro)
+library(GGally)
+library(xgboost)
+library(caret)
+library(rfVarImpOOB)
+library(hrbrthemes)
+library(tmap)
+library(sf)
+library(smotefamily)
+library(extrafont)
+```
+
+
+```{r}
+data <- read_csv('./accidents.csv', skip_empty_rows=TRUE, show_col_types = TRUE)
+data <- data.frame(data)
+
+data
+
+```
+# Data cleaning
+
+```{r}
+# removing all rows with at least an empty column
+data <- data[rowSums(is.na(data)) == 0,]
+```
+
+
+```{r}
+
+training_sample <- data
+
+training_sample$start_hour <-
+  format(as.POSIXct(training_sample$StartTime, format = "%Y/%m/%d %H:%M:%s"), "%H")
+training_sample$start_min <-
+  format(as.POSIXct(training_sample$StartTime, format = "%Y/%m/%d %H:%M:%s"), "%M")
+
+training_sample$end_hour <-
+  format(as.POSIXct(training_sample$EndTime, format = "%Y/%m/%d %H:%M:%s"), "%H")
+training_sample$end_min <-
+  format(as.POSIXct(training_sample$EndTime, format = "%Y/%m/%d %H:%M:%s"), "%M")
+
+training_sample$start_hour <- as.double(training_sample$start_hour)
+training_sample$start_min <- as.double(training_sample$start_min)
+training_sample$end_hour <- as.double(training_sample$end_hour)
+training_sample$end_min <- as.double(training_sample$end_min)
+
+training_sample <- subset(training_sample, select = -c(StartTime, EndTime, Street, City, State, Zipcode, WeatherCondition, Amenity, Bump, Crossing, GiveWay, Junction, NoExit, Railway, Roundabout, Station, Stop, TrafficCalming, TrafficSignal))
+
+training_sample
+```
+
+# SMOTE (Synthetic data generation to avoid unbalanced classes)
+
+```{r}
+new_data <- SMOTE(X = training_sample, target = training_sample$Severity, K = 5, dup_size = 30)
+new_data <- new_data$data %>% select(-class)
+new_data <- SMOTE(X = new_data, target = new_data$Severity, K = 5, dup_size = 5)
+final_ts_with_severity <- new_data$data %>% select(-class)
+
+final_ts <- subset(final_ts_with_severity, select = -c(Severity))
+
+final_ts_with_severity <- final_ts_with_severity %>% sample_frac(size = 1)
+final_ts <- final_ts %>% sample_frac(size = 1)
+```
+
+# Exploratory analysis
+
+```{r}
+# Plotting US accidents map
+mydata_sf <- st_as_sf(training_sample, coords = c("StartLng", "StartLat"), crs = 4326)
+data("World")
+
+map <- tm_shape(World[World$iso_a3 == "USA",]) +
+  tm_polygons() +
+  tm_shape(mydata_sf) +
+  tm_bubbles(col = "red", size = 0.2)
+
+map
+
+temp <- ggplot(training_sample, aes(x = Visibility, group= Severity, fill = Severity)) +
+         geom_density(adjust=1, alpha=0.8) + theme_ipsum() +
+        labs(x = "Visibility", y = "Density", fill = "Severity") +
+        ggtitle("Density distribution of the visibility")
+
+temp
+
+# Plotting features distributions
+col_names <- names(training_sample)
+for (i in 1:13) {
+  g <- ggplot(training_sample, aes(x=training_sample[, i], y="Value")) +
+        geom_boxplot() +
+        labs(title=col_names[i])
+        theme_gray()
+        
+  print(g)
+    
+}
+
+# Calculating number of data points for each class
+severity_summary <- final_ts_with_severity %>% 
+  group_by(Severity) %>%
+  summarize(Total= n()) %>%
+  top_n(10, Total) %>%
+  arrange(desc(Total))
+
+severity_summary
+
+# Plotting and highlighting unbalanced class problem
+severity_summary_chart <- 
+  ggplot(data = severity_summary, mapping = aes(x=Severity,y=Total)) + 
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal()
+
+severity_summary_chart
+
+```
+# PCA (Principal Component Analysis)
+
+```{r}
+corr_matrix <- cor(final_ts)
+corrplot(corr_matrix, method = "color")
+
+pca_results <- prcomp(final_ts, scale. = TRUE)
+
+biplot(pca_results, scale = 0)
+
+# Calculating explained variance for each PC
+var_explained = pca_results$sdev^2 / sum(pca_results$sdev^2)
+pca_data <- data.frame(
+  PC = 1:length(var_explained),
+  Variance = var_explained
+)
+
+# Plotting the screeplot with most explained variance components
+screeplot_pca <- ggplot(pca_data, aes(x = PC, y = Variance)) +
+  geom_line() +
+  geom_point() +
+  xlab("Principal Component") +
+  ylab("Percentage of Variance Explained") +
+  ggtitle("Scree Plot")
+
+
+pca_results$rotation
+
+# Plotting the bidimensional scatter plot with the loadings
+ggplot2::autoplot(pca_results, data = final_ts_with_severity, colour = "Severity", loadings = TRUE, loadings.label = TRUE, loadings.label.size = 3, scale = 1)
+ggplot2::autoplot(pca_results, data = final_ts_with_severity, colour = "Severity", log = 'x') + 
+  scale_y_continuous(trans = 'log')
+
+
+```
+# Hierarchical clustering
+
+```{r}
+# sampling for clustering
+data_pca <- sample_n(final_ts, 1000)
+
+# running PCA for the HCPC function
+pca_results <- PCA(data_pca, scale.unit = TRUE,
+  ncp = 2,
+  ind.sup = NULL,
+  quali.sup = NULL,
+  graph = FALSE)
+
+# extracting the eigenvalues and plotting the first two PCs
+fviz_eig(pca_results, addlabels = TRUE, ylim = c(0, 36))
+fviz_contrib(pca_results, 'var', axes = 1, xtickslab.rt = 90)
+fviz_contrib(pca_results, 'var', axes = 2, xtickslab.rt = 90)
+
+hcpc <- HCPC(pca_results, graph = F)
+
+# generating the dendrogram
+fviz_dend(
+  hcpc,
+  k = 4,
+  ggtheme = theme_bw(),
+  cex = 0.7, repel = T,                     
+  palette = 'Dark2',
+  rect = TRUE, rect_fill = TRUE,   # Add rectangle around groups
+  rect_border = 'Dark2'         # Augment the room for labels
+)
+data_pca$cluster <- hcpc$data.clust$clust
+data_pca <- data_pca %>% select(-tail(names(.), 1))
+clusters <-  hcpc$data.clust$clust
+
+dist_matrix <- dist(pca_results$ind$coord)
+dist_matrix <- as.matrix(data.frame(apply(dist_matrix, 2, as.numeric)))
+sil_coeff <- silhouette(clusters, dist_matrix)
+```
+
+
+```{r}
+
+t <- data_pca[,14]
+
+# plot clutering result and group characteristics
+
+clusters_summary <- data_pca %>% 
+  group_by(cluster) %>%
+  summarize(Total= n()) %>%
+  arrange(desc(Total))
+
+clusters_summary
+
+clusters_summary_chart <- 
+  ggplot(data = clusters_summary, mapping = aes(x=cluster,y=Total)) + 
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal()
+
+clusters_summary_chart
+
+# Average temperature
+temp_clusters_summary <- data_pca %>% 
+  group_by(cluster) %>%
+  summarize(Average= mean(Temperature)) %>%
+  arrange(desc(Average))
+
+# Average humidity
+hum_clusters_summary <- data_pca %>% 
+  group_by(cluster) %>%
+  summarize(Average= mean(Humidity)) %>%
+  arrange(desc(Average))
+
+# Average start_hour
+hour_clusters_summary <- data_pca %>% 
+  group_by(cluster) %>%
+  summarize(Average= mean(start_hour)) %>%
+  arrange(desc(Average))
+
+# Average visibility
+vis_clusters_summary <- data_pca %>% 
+  group_by(cluster) %>%
+  summarize(Average= mean(Visibility)) %>%
+  arrange(desc(Average))
+
+```
+
+# Gradient Boosting and XGBoost
+
+```{r}
+
+final_ts_with_severity$Severity <- as.double(final_ts_with_severity$Severity)
+
+train_data <- head(final_ts_with_severity, n = round(0.8 * nrow(final_ts_with_severity)))
+test_data <- tail(final_ts_with_severity, n = round(0.2 * nrow(final_ts_with_severity)))
+
+train_label <- train_data$Severity
+test_label <- test_data$Severity
+
+train_data <- train_data[,-1]
+test_data <- test_data[,-1]
+
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = train_label) 
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label= test_label)
+
+params <- list(
+  objective = "multi:softmax",
+  num_class = 5,  # Number of classes
+  max_depth = 3,
+    eval_metric = "merror", # multiclass classification error rate
+  eta = 0.2, # learning rate
+  gamma = 1,
+  verbose = 1
+)
+
+# train a model using the training data
+model <- xgb.train(data = dtrain, # the data   
+                 nround = 200,
+                 early_stopping_rounds = 3,# max number of boosting iterations
+                  params = params,
+                 watchlist = list(train=dtrain, test=dtest))  # the objective function
+
+# extract loss functions values during the iterations
+train_loss_fuction <- model$evaluation_log[, -3]
+test_loss_fuction <- model$evaluation_log[, -2]
+
+# Plotting the loss functions both on the training data and test data
+
+train_loss_chart <- ggplot(train_loss_fuction, aes(iter, train_merror)) +
+                    geom_line() +
+                    labs(x = "Iterations", y = "Loss function", title = "Loss function on training data")
+
+train_loss_chart
+
+test_loss_chart <- ggplot(test_loss_fuction, aes(iter, test_merror)) +
+                    geom_line() +
+                    labs(x = "Iterations", y = "Loss function", title = "Loss function on test data")
+
+test_loss_chart
+
+
+# generate predictions for testing data
+pred <- predict(model, dtest)
+
+# Exctracting and plotting the features importance for the splits
+importance_matrix <- xgb.importance(feature_names = colnames(final_ts), model= model)
+xgb.plot.importance(importance_matrix)
+
+xgb.plot.tree(names(final_ts), model = model)
+
+# Calculating the confusion matrix to obtain the accuracy
+result <- confusionMatrix(factor(pred, levels= 1:4), factor(test_label, levels = 1:4))
+result
+
+# K-fold cross-validation for avoiding overfitting and improve the accuracy 
+train_cols <- select(final_ts_with_severity, -c(Severity))
+                     
+dtrain_all <- xgb.DMatrix(data = as.matrix(train_cols), label = final_ts_with_severity$Severity)
+
+# Perform k-fold cross-validation
+cv_results <- xgb.cv(
+  params = params,
+  data = dtrain_all,
+  nfold = 5,  # Number of folds
+  nrounds = 200,  # Number of rounds
+  early_stopping_rounds = 3,  # Early stopping rounds
+  verbose = 1,  # Print progress
+)
+
+# no improvements to the model with 5-fold cross validation
+```
+
+
